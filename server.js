@@ -43,6 +43,24 @@ function seedDemo() {
       db.prepare('UPDATE projects SET sub_version = sub_version + 1 WHERE id = ?').run(pid);
     });
     tx2();
+
+    // 播种两个说话人并按行交替归属，便于直接体验署名版导出
+    const p2 = loadProject(db, pid);
+    const tx3 = db.transaction(() => {
+      const insSp = db.prepare('INSERT INTO speakers (project_id, number, display_name) VALUES (?, ?, ?)');
+      const idA = insSp.run(pid, 1, '茶客甲').lastInsertRowid;
+      const idB = insSp.run(pid, 2, '掌柜乙').lastInsertRowid;
+      const insAt = db.prepare(
+        'INSERT INTO attributions (project_id, subtitle_id, speaker_id, speaker_number, cue_version) VALUES (?, ?, ?, ?, 1)'
+      );
+      p2.subtitles.forEach((c, i) => {
+        const sid = i % 2 === 0 ? idA : idB;
+        const num = i % 2 === 0 ? 1 : 2;
+        insAt.run(pid, c.id, sid, num);
+      });
+      db.prepare('UPDATE projects SET attribution_version = attribution_version + 1 WHERE id = ?').run(pid);
+    });
+    tx3();
   }
   console.log(`[seed] 已创建演示项目 #${pid}（${sample.words.length} 词 / ${sample.cuts.length} 切点）`);
 }

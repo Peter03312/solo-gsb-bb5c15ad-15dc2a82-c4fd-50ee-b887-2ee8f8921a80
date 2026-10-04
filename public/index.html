@@ -109,6 +109,22 @@
         <ul id="tr-export-list" class="export-list"></ul>
         <p class="hint">导出前须当前每行都有<strong>有效当前译文</strong>且整版符合时间与切点约束，否则列出缺漏/冲突且不生成快照；已导出快照不可变。</p>
       </section>
+      <section class="panel">
+        <h2>⑧ 说话人标注与署名版导出 <span id="sp-version" class="tag"></span></h2>
+        <p class="hint">维护<strong>说话人编号→显示名</strong>（改名推进归属版本）；按字幕 ID 归属，携带读取时行版本与归属版本，<strong>锁定行也可标注</strong>。
+        重排保留 ID 的行归属继续有效；原行删除后归属留作历史，新行待标注，不按展示序号转移。显示名不得含换行或 <code>&lt; &gt;</code>。</p>
+        <div class="row">
+          <input id="sp-new-name" type="text" placeholder="新说话人显示名" spellcheck="false">
+          <button id="btn-sp-create" class="secondary">＋ 新建说话人</button>
+        </div>
+        <div class="row buttons">
+          <button id="btn-sp-load" class="secondary">载入归属</button>
+          <button id="btn-sp-export-src" class="primary">署名版导出（原文）</button>
+          <button id="btn-sp-export-tr" class="primary">署名版导出（当前译文语言）</button>
+        </div>
+        <ul id="sp-export-list" class="export-list"></ul>
+        <p class="hint">署名版另存为<strong>不可变快照</strong>（WebVTT 说话人标签 <code>&lt;v 名称&gt;…&lt;/v&gt;</code>）；普通导出与旧下载内容不变，原文与译文共用时间轴。</p>
+      </section>
     </aside>
 
     <section class="content">
@@ -145,6 +161,17 @@
         <ul id="tr-export-list2" class="export-list"></ul>
         <h3>历史译文（源行已重排删除/重新导入，不按序号挪用）</h3>
         <div id="tr-history" class="tr-history"></div>
+      </div>
+
+      <div id="sp-panel" class="panel hidden">
+        <h2>说话人归属 <span id="sp-stats" class="hint"></span></h2>
+        <p class="hint">每行选择说话人后点该行「保存」（携带行版本与归属版本）；也可改显示名。重排后保留 ID 的行归属保留，删除行进入历史。</p>
+        <div id="speakers-registry" class="sp-registry"></div>
+        <div id="sp-table" class="sp-table"></div>
+        <h3>署名版导出快照</h3>
+        <ul id="sp-export-list2" class="export-list"></ul>
+        <h3>历史归属（原行已删除，留档，不按序号转移）</h3>
+        <div id="sp-history" class="sp-history"></div>
       </div>
 
       <div class="panel">

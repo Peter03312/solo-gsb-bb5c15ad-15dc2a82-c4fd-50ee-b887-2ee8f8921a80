@@ -3,7 +3,8 @@
 const express = require('express');
 const {
   loadProject, listRevisions, loadRevision,
-  listWordRevisions, loadWordRevision, bumpSubVersion, DEFAULT_RULES,
+  listWordRevisions, loadWordRevision, bumpSubVersion, bumpAttributionVersion,
+  DEFAULT_RULES,
 } = require('./db');
 const { computeLayout, validateStructure, validateRules } = require('./layout');
 const { validateWords, validateCuts, validateRules: validateRulesInput, validateSubtitleEdit } = require('./validate');
@@ -19,6 +20,13 @@ const {
   parseTranslationBatchBody, contentHash, evaluateBatch,
   listBatches: listTranslationBatches, loadBatch: loadTranslationBatch,
 } = require('./translation-batch');
+const speakerMod = require('./speaker');
+const {
+  validateSpeakerName, listSpeakers, getSpeakerByNumber, createSpeaker, renameSpeaker,
+  syncAttributions, parseAttributionBatchBody, evaluateAttributionBatch, applyAttributionBatch,
+  buildAttributionView, parseAttributedExportBody, evaluateAttributedExport,
+  insertAttributedExport, listAttributedExports, getAttributedExport,
+} = speakerMod;
 const { toWebVtt } = require('./vtt');
 
 /**
@@ -125,8 +133,10 @@ function createApp(db) {
       bumpSubVersion(db, p.id);
     });
     tx();
-    // 旧字幕行已全部删除：各语言译文全部留作历史（不按序号挪用到新排版的行）
+    // 旧字幕行已全部删除：各语言译文全部留作历史（不按序号挪用到新排版的行）；
+    // 说话人归属同样留作历史（不按展示序号转移，新排版的行待标注）。
     syncTranslations(db, p.id);
+    syncAttributions(db, p.id);
     res.json(loadProject(db, p.id));
   });
 
@@ -233,6 +243,8 @@ function createApp(db) {
     });
     tx();
     syncTranslations(db, p.id);
+    // 重排删除行的归属留作历史；保留 ID 的行（仅 idx 变化或原地更新）归属继续有效
+    syncAttributions(db, p.id);
     const fresh = loadProject(db, p.id);
     res.json({ sub_version: fresh.sub_version, subtitles: fresh.subtitles });
   });
@@ -360,6 +372,359 @@ function createApp(db) {
     res.setHeader(
       'Content-Disposition',
       `attachment; filename="project-${p.id}-v${row.version}.vtt"`
+    );
+    res.send(row.content);
+  });
+
+  // ---------- 说话人名册与归属标注（署名版导出） ----------
+  //
+  // 项目内维护说话人编号（服务端分配、不回收、不可变）→ 显示名（可改，改名推进
+  // 归属版本 attribution_version）。归属按字幕 ID 锚定：提交携带读取时行版本
+  // cue_version 与归属版本 attribution_version，编号须存在；过期返回当前值；
+  // 锁定行也可标注。重排保留 ID 的行归属继续有效；原行删除后归属留作历史，
+  // 新行待标注，不按展示序号转移。署名版导出携带字幕集版本与归属版本，在同一
+  // 事务内核对每行都有有效归属（译文另须逐行 current、版本未变），通过才生成
+  // 带 <v 显示名> 标签的不可变快照；普通导出与旧下载内容保持兼容。
+
+  /** 说话人名册（编号升序，附当前有效归属条数） */
+  app.get('/api/projects/:id/speakers', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    res.json({ project_id: p.id, attribution_version: p.attribution_version, speakers: listSpeakers(db, p.id) });
+  });
+
+  /** 新建说话人：服务端分配项目内下一个编号（不回收），不推进归属版本 */
+  app.post('/api/projects/:id/speakers', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    const { display_name } = req.body || {};
+    const reasons = validateSpeakerName(display_name);
+    if (reasons.length > 0) {
+      return res.status(400).json({ error: '说话人显示名非法，未创建', errors: reasons });
+    }
+    const speaker = createSpeaker(db, p.id, display_name.trim());
+    res.status(201).json({
+      speaker,
+      attribution_version: p.attribution_version,
+    });
+  });
+
+  /**
+   * 修改说话人显示名：携带读取时归属版本 attribution_version（改名会推进它）；
+   * 过期 → 409 返回当前名册与归属版本。显示名含换行或 <、> → 400。
+   */
+  app.patch('/api/projects/:id/speakers/:number', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    const number = Number(req.params.number);
+    const speaker = getSpeakerByNumber(db, p.id, number);
+    if (!speaker) return res.status(404).json({ error: `说话人编号 ${number} 不存在` });
+
+    const { attribution_version, display_name } = req.body || {};
+    if (!Number.isInteger(attribution_version) || attribution_version < 0) {
+      return res.status(400).json({
+        error: '请求非法',
+        errors: ['attribution_version（读取时归属版本）必须是 ≥0 的整数'],
+      });
+    }
+    if (attribution_version !== p.attribution_version) {
+      return res.status(409).json({
+        error: `归属版本过期：你基于 v${attribution_version} 读取，当前已是 v${p.attribution_version}，请刷新后重试`,
+        current: { attribution_version: p.attribution_version, speakers: listSpeakers(db, p.id) },
+      });
+    }
+    const reasons = validateSpeakerName(display_name);
+    if (reasons.length > 0) {
+      return res.status(400).json({ error: '说话人显示名非法，未修改', errors: reasons });
+    }
+    const done = renameSpeaker(db, p.id, speaker.id, display_name.trim());
+    res.json({ speaker: done.speaker, attribution_version: done.attribution_version });
+  });
+
+  /** 归属并列查询：名册 + 逐行字幕/归属状态 + 历史归属（只读） */
+  app.get('/api/projects/:id/attributions', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    res.json(buildAttributionView(db, p.id));
+  });
+
+  /**
+   * 标注单条字幕归属（锁定行也可标注）。
+   *   { attribution_version, cue_version, speaker_number }
+   * 201 首次标注 / 200 覆盖更新；400 形状非法或编号不存在；404 字幕不存在；
+   * 409 归属版本或行版本过期（返回当前值）。
+   */
+  app.put('/api/projects/:id/attributions/subtitles/:sid', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    const sid = Number(req.params.sid);
+    const b = req.body || {};
+    const errors = [];
+    if (!Number.isInteger(b.attribution_version) || b.attribution_version < 0) {
+      errors.push('attribution_version（读取时归属版本）必须是 ≥0 的整数');
+    }
+    if (!Number.isInteger(b.cue_version) || b.cue_version < 1) {
+      errors.push('cue_version（读取时字幕行版本）必须是 ≥1 的整数');
+    }
+    if (!Number.isInteger(b.speaker_number) || b.speaker_number < 1) {
+      errors.push('speaker_number（说话人编号）必须是 ≥1 的整数');
+    }
+    if (errors.length > 0) return res.status(400).json({ error: '归属标注请求非法', errors });
+
+    const cue = db.prepare('SELECT * FROM subtitles WHERE id = ? AND project_id = ?').get(sid, p.id);
+    if (!cue) return res.status(404).json({ error: `字幕 ${req.params.sid} 不存在（可能已被重排删除），请按当前行重新标注` });
+
+    if (b.attribution_version !== p.attribution_version) {
+      return res.status(409).json({
+        error: `归属版本过期：你基于 v${b.attribution_version} 读取，当前已是 v${p.attribution_version}，请刷新后重试`,
+        current: buildAttributionView(db, p.id),
+      });
+    }
+    if (b.cue_version !== cue.version) {
+      return res.status(409).json({
+        error: `字幕行版本过期：你基于 v${b.cue_version} 读取，当前已是 v${cue.version}`,
+        current: { cue, attribution_version: p.attribution_version },
+      });
+    }
+    const speaker = getSpeakerByNumber(db, p.id, b.speaker_number);
+    if (!speaker) {
+      return res.status(400).json({
+        error: `说话人编号 ${b.speaker_number} 不存在：请先用名册接口建立说话人`,
+        speakers: listSpeakers(db, p.id),
+      });
+    }
+
+    const existing = db.prepare(
+      `SELECT * FROM attributions WHERE project_id = ? AND subtitle_id = ? AND status = 'active'`
+    ).get(p.id, sid);
+    const tx = db.transaction(() => {
+      if (existing) {
+        db.prepare(
+          `UPDATE attributions SET speaker_id = ?, speaker_number = ?, cue_version = ?,
+             updated_at = datetime('now') WHERE id = ?`
+        ).run(speaker.id, speaker.number, cue.version, existing.id);
+      } else {
+        db.prepare(
+          `INSERT INTO attributions (project_id, subtitle_id, speaker_id, speaker_number, cue_version)
+           VALUES (?, ?, ?, ?, ?)`
+        ).run(p.id, sid, speaker.id, speaker.number, cue.version);
+      }
+      return bumpAttributionVersion(db, p.id);
+    });
+    const attributionVersion = tx();
+    const row = db.prepare(
+      `SELECT a.id, a.subtitle_id, a.speaker_id, a.speaker_number, a.cue_version,
+              sp.display_name AS speaker_name
+         FROM attributions a JOIN speakers sp ON sp.id = a.speaker_id
+        WHERE a.project_id = ? AND a.subtitle_id = ? AND a.status = 'active'`
+    ).get(p.id, sid);
+    res.status(existing ? 200 : 201).json({
+      attribution: {
+        attribution_id: row.id, subtitle_id: row.subtitle_id,
+        speaker_id: row.speaker_id, number: row.speaker_number,
+        display_name: row.speaker_name, cue_version: row.cue_version,
+      },
+      attribution_version: attributionVersion,
+    });
+  });
+
+  /**
+   * 批量标注归属（一组字幕，锁定行也可标注）。
+   *   { attribution_version, items:[{subtitle_id, cue_version, speaker_number}] }
+   * 同一事务内核对归属版本/行版本/编号存在；任一行过期或编号缺失则整批不写入，
+   * 按行返回当前值与原因。全部通过后整批写入，归属版本只推进一次。
+   *   400 形状非法/编号不存在；409 归属版本或行版本过期/行已删除（带 current）。
+   */
+  app.post('/api/projects/:id/attributions/batch', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    const parsed = parseAttributionBatchBody(req.body);
+    if (!parsed.ok) {
+      return res.status(400).json({ error: '归属批量标注请求非法，未写入', errors: parsed.errors });
+    }
+
+    class AttributionReject extends Error {
+      constructor(statusCode, payload) {
+        super(payload.error || '归属标注被拒绝');
+        this.statusCode = statusCode;
+        this.payload = payload;
+      }
+    }
+
+    const tx = db.transaction(() => {
+      const fresh = loadProject(db, p.id);
+      const evaluation = evaluateAttributionBatch(fresh, parsed.request);
+
+      if (evaluation.attribution_version_stale) {
+        throw new AttributionReject(409, {
+          error: `归属版本过期：你基于 v${parsed.request.attribution_version} 读取，当前已是 v${fresh.attribution_version}，请刷新后重试`,
+          attribution_version_stale: true,
+          current: buildAttributionView(db, fresh.id),
+        });
+      }
+
+      const bad = evaluation.items.filter((it) => it.state !== 'ok');
+      if (bad.length > 0) {
+        const missingSpeaker = bad.some((it) => it.state === 'speaker_missing');
+        const staleCue = bad.some(
+          (it) => it.state === 'cue_missing' || it.state === 'cue_version_stale'
+        );
+        // 编号不存在属请求内容问题（400）；行缺失/行版本过期属过期（409）。两类同时存在按 400 会掩盖
+        // 过期信息，这里若有任一过期项按 409（编号问题也在该行 reasons 中给出）。
+        const code = staleCue ? 409 : 400;
+        throw new AttributionReject(code, {
+          error: staleCue
+            ? `归属批量标注存在 ${bad.length} 行过期/失效项，整批未写入，请刷新后重新提交`
+            : `归属批量标注有 ${bad.length} 行引用了不存在的说话人编号，整批未写入`,
+          attribution_version: fresh.attribution_version,
+          items: bad.map((it) => ({
+            ord: it.ord,
+            subtitle_id: it.subtitle_id,
+            cue_version: it.cue_version,
+            speaker_number: it.speaker_number,
+            state: it.state,
+            cue: it.cue,
+            existing: it.existing
+              ? {
+                  attribution_id: it.existing.id,
+                  number: it.existing.speaker_number,
+                  speaker_name: it.existing.speaker_name,
+                }
+              : null,
+            reasons: it.reasons,
+          })),
+          current: buildAttributionView(db, fresh.id),
+          speakers: listSpeakers(db, fresh.id),
+        });
+      }
+
+      const done = applyAttributionBatch(db, fresh.id, evaluation);
+      return done;
+    });
+
+    try {
+      const done = tx();
+      res.status(201).json({
+        applied: done.items.length,
+        items: done.items,
+        attribution_version: done.attribution_version,
+      });
+    } catch (err) {
+      if (err instanceof AttributionReject) return res.status(err.statusCode).json(err.payload);
+      throw err;
+    }
+  });
+
+  /**
+   * 署名版导出：携带 sub_version 与 attribution_version，同一事务内核对
+   * 每条当前字幕均有有效归属（说话人名册存在、显示名可安全写入标签）。
+   * 不带 lang → 原文；带 lang + translations（逐行 [{subtitle_id, version}]）→ 一种
+   * 目标语言，译文须逐行 current、版本未变且满足现行字数/字速。
+   * 失败按行列原因（codes）且不生成快照；成功另存 attributed_exports 不可变快照，
+   * 普通 exports/translation_exports 与旧下载内容不变。原文与译文共用同一时间轴。
+   */
+  app.post('/api/projects/:id/attributed-exports', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    const parsed = parseAttributedExportBody(req.body);
+    if (!parsed.ok) {
+      return res.status(400).json({ error: '署名版导出请求非法，未生成快照', errors: parsed.errors });
+    }
+
+    class ExportReject extends Error {
+      constructor(statusCode, payload) {
+        super(payload.error || '署名版导出被拒绝');
+        this.statusCode = statusCode;
+        this.payload = payload;
+      }
+    }
+
+    const tx = db.transaction(() => {
+      const fresh = loadProject(db, p.id);
+      const result = evaluateAttributedExport(db, fresh, parsed.request);
+
+      if (result.stale.sub_version || result.stale.attribution_version) {
+        const why = [];
+        if (result.stale.sub_version) {
+          why.push(`字幕集版本漂移：提交基于 v${parsed.request.sub_version}，当前已是 v${fresh.sub_version}`);
+        }
+        if (result.stale.attribution_version) {
+          why.push(`归属版本漂移：提交基于 v${parsed.request.attribution_version}，当前已是 v${fresh.attribution_version}`);
+        }
+        throw new ExportReject(409, {
+          error: `${why.join('；')}；未生成快照，请刷新后重新提交`,
+          stale: result.stale,
+          current: {
+            sub_version: fresh.sub_version,
+            attribution_version: fresh.attribution_version,
+            rules_version: fresh.rules.version,
+          },
+        });
+      }
+      if (result.conflicts.length > 0 || result.rows.length > 0) {
+        throw new ExportReject(422, {
+          error: result.lang
+            ? `署名版译文导出（${result.lang}）未通过核对：整版冲突 ${result.conflicts.length} 处，逐行问题 ${result.rows.length} 行；未生成快照`
+            : `署名版原文导出未通过核对：整版冲突 ${result.conflicts.length} 处，逐行问题 ${result.rows.length} 行；未生成快照`,
+          sub_version: fresh.sub_version,
+          attribution_version: fresh.attribution_version,
+          rules_version: fresh.rules.version,
+          conflicts: result.conflicts,
+          rows: result.rows,
+        });
+      }
+
+      // 全部通过：用当前显示名与（原文或译文）文本生成带说话人标签的 WebVTT
+      const content = toWebVtt(result.cues);
+      const saved = insertAttributedExport(db, fresh.id, {
+        kind: result.lang ? 'translation' : 'source',
+        lang: result.lang,
+        content,
+        cue_count: result.cues.length,
+        sub_version: fresh.sub_version,
+        attribution_version: fresh.attribution_version,
+        rules_version: fresh.rules.version,
+      });
+      return { saved, content };
+    });
+
+    try {
+      const done = tx();
+      res.status(201).json({
+        version: done.saved.version,
+        kind: done.saved.kind,
+        lang: done.saved.lang,
+        cue_count: done.saved.cue_count,
+        sub_version: done.saved.sub_version,
+        attribution_version: done.saved.attribution_version,
+        rules_version: done.saved.rules_version,
+        download_url: `/api/projects/${p.id}/attributed-exports/${done.saved.version}`,
+        content: done.content,
+      });
+    } catch (err) {
+      if (err instanceof ExportReject) return res.status(err.statusCode).json(err.payload);
+      throw err;
+    }
+  });
+
+  /** 署名版快照清单（倒序，原文与译文共用一个序列） */
+  app.get('/api/projects/:id/attributed-exports', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    res.json({ project_id: p.id, exports: listAttributedExports(db, p.id) });
+  });
+
+  /** 下载某版本署名版 WebVTT（内容创建后不变） */
+  app.get('/api/projects/:id/attributed-exports/:version', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    const row = getAttributedExport(db, p.id, Number(req.params.version));
+    if (!row) return res.status(404).json({ error: `署名版快照版本 ${req.params.version} 不存在` });
+    res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
+    const suffix = row.kind === 'source' ? 'src' : row.lang;
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="project-${p.id}-signed-${suffix}-v${row.version}.vtt"`
     );
     res.send(row.content);
   });
@@ -856,8 +1221,10 @@ function createApp(db) {
       }
 
       const subVersion = bumpSubVersion(db, fresh.id);
-      // 词时间/受影响区间重排导致的源行变化：受影响行译文转待复核，被删行译文留历史
+      // 词时间/受影响区间重排导致的源行变化：受影响行译文转待复核，被删行译文留历史；
+      // 被删行的说话人归属同样留作历史，新行待标注（不按展示序号转移）。
       syncTranslations(db, fresh.id);
+      syncAttributions(db, fresh.id);
       db.prepare(
         `UPDATE word_revisions SET status = 'confirmed', confirmed_at = datetime('now'),
            confirmed_sub_version = ? WHERE id = ?`

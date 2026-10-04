@@ -8,6 +8,7 @@ const state = {
   edits: new Map(),   // cueId -> { text, start_ms, end_ms } 未保存修改
   trLang: null,       // 当前译文语言
   trView: null,       // 该语言并列查询视图
+  spView: null,       // 说话人归属并列视图（载入后存在）
 };
 
 // ---------- 工具 ----------
@@ -63,7 +64,9 @@ async function loadProjects(selectId) {
   sel.value = id;
   state.trLang = null;
   state.trView = null;
+  state.spView = null;
   $('#tr-panel').classList.add('hidden');
+  $('#sp-panel').classList.add('hidden');
   await loadProject(Number(sel.value));
 }
 
@@ -75,6 +78,8 @@ async function loadProject(id) {
   // 切换/刷新项目后重新载入当前语言视图（项目不同则收起面板）
   if (state.trLang) loadTranslation(state.trLang);
   else $('#tr-panel').classList.add('hidden');
+  // 归属面板若已载入，则随字幕集刷新重新拉取（保持归属版本/行版本最新）
+  if (state.spView) loadSpeakers(true);
   renderAll();
 }
 
@@ -86,6 +91,7 @@ function renderAll() {
   renderExports();
   renderRevisions();
   renderWordRevisions();
+  renderSpeakerVersionTag();
   $('#force-row').classList.add('hidden');
 }
 
@@ -1109,3 +1115,206 @@ $('#tr-lang').addEventListener('keydown', (e) => {
 $('#btn-tr-export').addEventListener('click', exportTranslation);
 
 loadProjects();
+
+// ---------- ⑧ 说话人标注与署名版导出 ----------
+
+function renderSpeakerVersionTag() {
+  const p = state.project;
+  $('#sp-version').textContent = p ? `归属 v${p.attribution_version}` : '';
+}
+
+async function createSpeaker() {
+  if (!state.project) return;
+  const display_name = $('#sp-new-name').value.trim();
+  if (!display_name) return toast('请填写显示名', true);
+  const { status, body } = await api(`/api/projects/${state.project.id}/speakers`, {
+    method: 'POST', body: JSON.stringify({ display_name }),
+  });
+  if (status !== 201) return toast(body?.error || '创建失败', true);
+  $('#sp-new-name').value = '';
+  toast(`已建立说话人编号 ${body.speaker.number}：${body.speaker.display_name}`);
+  await loadProject(state.project.id);
+  await loadSpeakers(true);
+}
+
+async function loadSpeakers(keepPanel) {
+  if (!state.project) return;
+  const { status, body } = await api(`/api/projects/${state.project.id}/attributions`);
+  if (status !== 200) { toast(body?.error || '载入归属失败', true); return; }
+  state.spView = body;
+  renderSpeakers();
+  if (!keepPanel) $('#sp-panel').classList.remove('hidden');
+}
+
+function speakerOptions(selectedNumber) {
+  const v = state.spView;
+  let html = '<option value="">（未标注）</option>';
+  for (const s of v.speakers) {
+    html += `<option value="${s.number}"${s.number === selectedNumber ? ' selected' : ''}>${s.number}. ${escapeHtml(s.display_name)}</option>`;
+  }
+  return html;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+
+function renderSpeakers() {
+  const v = state.spView;
+  if (!v) return;
+  $('#sp-stats').textContent =
+    `字幕集 v${v.sub_version} / 归属 v${v.attribution_version}：已标注 ${v.counts.attributed}/${v.counts.cues}，历史 ${v.counts.history}`;
+
+  // 名册（可改名）
+  const reg = $('#speakers-registry');
+  reg.innerHTML = '';
+  v.speakers.forEach((s) => {
+    const div = document.createElement('div');
+    div.className = 'sp-reg-row';
+    div.innerHTML =
+      `<span class="sp-num">#${s.number}</span>
+       <input type="text" value="${escapeHtml(s.display_name)}" data-number="${s.number}" class="sp-rename-input">
+       <button class="secondary sp-rename" data-number="${s.number}">改名</button>
+       <span class="hint">${s.attribution_count} 条归属</span>`;
+    reg.appendChild(div);
+  });
+  reg.querySelectorAll('.sp-rename').forEach((btn) => {
+    btn.addEventListener('click', () => renameSpeaker(Number(btn.dataset.number)));
+  });
+
+  // 逐行归属
+  const box = $('#sp-table');
+  box.innerHTML = '';
+  if (v.cues.length === 0) box.innerHTML = '<div class="empty">暂无字幕。</div>';
+  v.cues.forEach((c) => {
+    const row = document.createElement('div');
+    row.className = 'sp-row' + (c.locked ? ' locked' : '');
+    row.innerHTML =
+      `<div class="sp-cue">${c.locked ? '🔒 ' : ''}#${c.subtitle_id} ${escapeHtml(c.text)}
+         <span class="hint">行 v${c.cue_version} · ${fmtMs(c.start_ms)}–${fmtMs(c.end_ms)}</span></div>
+       <select class="sp-select" data-sid="${c.subtitle_id}">${speakerOptions(c.attribution?.number)}</select>
+       <button class="primary sp-save" data-sid="${c.subtitle_id}">保存</button>`;
+    box.appendChild(row);
+  });
+  box.querySelectorAll('.sp-save').forEach((btn) => {
+    btn.addEventListener('click', () => saveAttribution(Number(btn.dataset.sid)));
+  });
+
+  // 快照清单（两处）
+  const drawList = (el) => {
+    el.innerHTML = '';
+    listAttributedExports().then((rows) => {
+      if (!rows) return;
+      rows.forEach((e) => {
+        const li = document.createElement('li');
+        const label = e.kind === 'source' ? '原文' : `译文 ${e.lang}`;
+        li.innerHTML = `<a href="/api/projects/${state.project.id}/attributed-exports/${e.version}">v${e.version}（${label}，${e.cue_count} 行）</a>
+          <span class="hint">字幕 v${e.sub_version}/归属 v${e.attribution_version} · ${e.created_at}</span>`;
+        el.appendChild(li);
+      });
+    });
+  };
+  drawList($('#sp-export-list2'));
+  drawList($('#sp-export-list'));
+
+  // 历史归属
+  const hist = $('#sp-history');
+  hist.innerHTML = v.history.length === 0
+    ? '<div class="empty">无</div>'
+    : v.history.map((h) =>
+        `<div>#${h.number} ${escapeHtml(h.display_name)}（原行 v${h.cue_version}，留档于 ${h.history_at}）</div>`
+      ).join('');
+}
+
+async function listAttributedExports() {
+  if (!state.project) return null;
+  const { body } = await api(`/api/projects/${state.project.id}/attributed-exports`);
+  return body.exports;
+}
+
+async function renameSpeaker(number) {
+  const input = document.querySelector(`.sp-rename-input[data-number="${number}"]`);
+  const display_name = input.value.trim();
+  if (!display_name) return toast('显示名不能为空', true);
+  const { status, body } = await api(
+    `${state.project.id ? `/api/projects/${state.project.id}/speakers/${number}` : ''}`,
+    { method: 'PATCH', body: JSON.stringify({ attribution_version: state.spView.attribution_version, display_name }) }
+  );
+  if (status !== 200) {
+    toast(`${body?.error || '改名失败'}${body?.current ? '（版本过期，正在刷新）' : ''}`, true);
+    if (status === 409) { await loadProject(state.project.id); await loadSpeakers(true); }
+    return;
+  }
+  toast(`编号 ${number} 已改名，归属版本 v${body.attribution_version}`);
+  await loadProject(state.project.id);
+  await loadSpeakers(true);
+}
+
+async function saveAttribution(sid) {
+  const select = document.querySelector(`.sp-select[data-sid="${sid}"]`);
+  const number = Number(select.value);
+  if (!number) return toast('请先在名册选择一位说话人（不支持在面板清除归属）', true);
+  const cue = state.spView.cues.find((c) => c.subtitle_id === sid);
+  const { status, body } = await api(
+    `/api/projects/${state.project.id}/attributions/subtitles/${sid}`,
+    { method: 'PUT', body: JSON.stringify({
+      attribution_version: state.spView.attribution_version,
+      cue_version: cue.cue_version,
+      speaker_number: number,
+    }) }
+  );
+  if (status !== 200 && status !== 201) {
+    toast(`${body?.error || '保存失败'}（${status}），已刷新当前值`, true);
+    await loadProject(state.project.id);
+    await loadSpeakers(true);
+    return;
+  }
+  toast(`已保存 #${sid} → 编号 ${body.attribution.number} ${body.attribution.display_name}`);
+  await loadProject(state.project.id);
+  await loadSpeakers(true);
+}
+
+async function exportAttributed(useLang) {
+  if (!state.project) return;
+  // 先确保归属已载入并全部标注
+  await loadSpeakers(true);
+  const v = state.spView;
+  const payload = {
+    sub_version: state.project.sub_version,
+    attribution_version: v.attribution_version,
+  };
+  let langDesc = '原文';
+  if (useLang) {
+    if (!state.trLang || !state.trView) return toast('请先在 ⑦ 面板载入一种目标语言译文', true);
+    payload.lang = state.trLang;
+    payload.translations = state.trView.entries
+      .filter((e) => e.translation)
+      .map((e) => ({ subtitle_id: e.cue.id, version: e.translation.version }));
+    langDesc = `译文 ${state.trLang}`;
+  }
+  const { status, body } = await api(`/api/projects/${state.project.id}/attributed-exports`, {
+    method: 'POST', body: JSON.stringify(payload),
+  });
+  if (status === 409) {
+    toast(`${body.error}（版本过期，已刷新）`, true);
+    await loadProject(state.project.id);
+    await loadSpeakers(true);
+    return;
+  }
+  if (status === 422) {
+    const parts = [];
+    if (body.conflicts?.length) parts.push(`整版冲突 ${body.conflicts.length}`);
+    if (body.rows?.length) parts.push(body.rows.slice(0, 5).map((r) =>
+      `#${r.subtitle_id}: ${r.codes.join(',')}`).join('；') + (body.rows.length > 5 ? ' …' : ''));
+    return toast(`署名版导出未通过：${parts.join(' / ')}`, true);
+  }
+  if (status !== 201) return toast(body?.error || '导出失败', true);
+  toast(`署名版${langDesc}快照 v${body.version} 已生成（${body.cue_count} 行）`);
+  renderSpeakers();
+}
+
+$('#btn-sp-create').addEventListener('click', createSpeaker);
+$('#btn-sp-load').addEventListener('click', () => loadSpeakers(false));
+$('#btn-sp-export-src').addEventListener('click', () => exportAttributed(false));
+$('#btn-sp-export-tr').addEventListener('click', () => exportAttributed(true));
+

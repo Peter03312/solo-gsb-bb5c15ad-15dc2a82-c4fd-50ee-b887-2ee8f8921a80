@@ -12,6 +12,8 @@ CREATE TABLE IF NOT EXISTS projects (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   name        TEXT NOT NULL,
   sub_version INTEGER NOT NULL DEFAULT 0,   -- 字幕集每次变更（编辑/锁定/重排）都 +1，用于乐观锁
+  -- 归属版本：说话人显示名修改或归属标注写入时 +1；归属标注与署名导出携带以防并发覆盖
+  attribution_version INTEGER NOT NULL DEFAULT 0,
   created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -216,7 +218,7 @@ CREATE TABLE IF NOT EXISTS translation_batches (
   UNIQUE(project_id, lang, batch_no)
 );
 
--- 回填批次逐行清单：字幕 ID、提交的源行版本、提交的译文版本（0=新建）与译文文本，
+-- 回填批次逐行清单：字幕 ID、提交的源行版本、源行版本、提交的译文版本（0=新建）与译文文本，
 -- 以及写入结果（created/updated 与写入后的译文版本）。
 CREATE TABLE IF NOT EXISTS translation_batch_items (
   id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -230,6 +232,61 @@ CREATE TABLE IF NOT EXISTS translation_batch_items (
   result_version INTEGER NOT NULL,            -- 写入后的译文版本
   UNIQUE(batch_id, ord)
 );
+
+-- 说话人名册：项目内维护“说话人编号（number）→ 显示名（display_name）”。
+-- 编号由服务端按项目顺序分配（不回收），显示名可修改（修改推进归属版本 attribution_version）；
+-- 编号一经建立不删除（历史归属仍可解析）。显示名不得含换行或 WebVTT 标签界定符（< >），
+-- 以保证署名版 WebVTT 的说话人标签语法合法。
+CREATE TABLE IF NOT EXISTS speakers (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id   INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  number       INTEGER NOT NULL,              -- 项目内说话人编号（1 起，不回收）
+  display_name TEXT NOT NULL,
+  created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(project_id, number)
+);
+
+-- 字幕行归属（按字幕 ID 锚定，与展示序号无关）：
+--   锁定行也可标注；重排中保留 ID 的行（无论是否仅顺序变化）归属继续有效；
+--   原行被删除（重排/重新导入）后归属留作历史（status=history），新行待标注，绝不按序号转移。
+-- 每条当前字幕最多一条有效归属（由下方部分唯一索引强制）。
+-- cue_version 记录标注时读取的行版本（乐观锁：过期 → 409 返回当前值）；
+-- speaker_number 为标注时说话人编号快照（编号不删除、不可变，仅显示名可改）。
+CREATE TABLE IF NOT EXISTS attributions (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id     INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  subtitle_id    INTEGER REFERENCES subtitles(id) ON DELETE SET NULL, -- 行删除后留空作历史
+  speaker_id     INTEGER NOT NULL REFERENCES speakers(id),
+  speaker_number INTEGER NOT NULL,             -- 标注时编号快照
+  cue_version    INTEGER NOT NULL,             -- 提交时读取的字幕行版本
+  status         TEXT NOT NULL DEFAULT 'active', -- active（有效）/ history（原行删除，留档）
+  created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_attributions_one_per_cue
+  ON attributions(project_id, subtitle_id)
+  WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_attributions_project
+  ON attributions(project_id, status, subtitle_id);
+
+-- 署名版导出的不可变 WebVTT 快照（与普通 exports / translation_exports 相互独立）：
+-- 普通导出与旧下载内容保持兼容（不含说话人标签）；署名版另存此序列，可查询、可下载，
+-- 内容一经生成不再改变（说话人改名、归属变更、字幕修订均不影响旧快照）。
+CREATE TABLE IF NOT EXISTS attributed_exports (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id        INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  kind              TEXT NOT NULL,            -- source（原文）/ translation（译文）
+  lang              TEXT,                     -- kind=translation 时为语言代号；原文为 NULL
+  version           INTEGER NOT NULL,         -- 项目内该序列递增（不分语言）
+  content           TEXT NOT NULL,            -- 含说话人标签的 WebVTT 快照，创建后不变
+  cue_count         INTEGER NOT NULL,
+  sub_version       INTEGER NOT NULL,         -- 快照时字幕集版本
+  attribution_version INTEGER NOT NULL,       -- 快照时归属版本
+  rules_version     INTEGER NOT NULL,         -- 快照时规则版本
+  created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(project_id, version)
+);
 `;
 
 const DEFAULT_RULES = { max_chars: 30, min_duration_ms: 800, max_cps: 20 };
@@ -240,7 +297,19 @@ function initDb(dbPath) {
   }
   const db = new Database(dbPath);
   db.exec(SCHEMA);
+  migrate(db);
   return db;
+}
+
+/**
+ * 轻量迁移：旧库在本次新增 speakers/attributions 前已建表，补齐列。
+ * CREATE TABLE IF NOT EXISTS 只负责新表；已存在的 projects 表需要手动加列。
+ */
+function migrate(db) {
+  const cols = db.prepare('PRAGMA table_info(projects)').all().map((c) => c.name);
+  if (!cols.includes('attribution_version')) {
+    db.exec('ALTER TABLE projects ADD COLUMN attribution_version INTEGER NOT NULL DEFAULT 0');
+  }
 }
 
 /** 项目完整载荷：项目 + 词 + 切点 + 规则 + 字幕 + 导出版本列表 */
@@ -258,6 +327,17 @@ function loadProject(db, id) {
     `SELECT id, idx, word_start, word_end, text, start_ms, end_ms, locked, version
      FROM subtitles WHERE project_id = ? ORDER BY idx`
   ).all(id);
+  const speakers = db.prepare(
+    'SELECT id, number, display_name, created_at, updated_at FROM speakers WHERE project_id = ? ORDER BY number'
+  ).all(id);
+  // 当前归属（每条当前字幕最多一条 active；按字幕 ID 锚定，与展示序号无关）
+  const attributions = db.prepare(
+    `SELECT a.id, a.subtitle_id, a.speaker_id, a.speaker_number, a.cue_version,
+            a.created_at, a.updated_at, sp.display_name AS speaker_name
+       FROM attributions a JOIN speakers sp ON sp.id = a.speaker_id
+      WHERE a.project_id = ? AND a.status = 'active'
+      ORDER BY a.subtitle_id`
+  ).all(id);
   const exportsList = db.prepare(
     'SELECT version, cue_count, created_at FROM exports WHERE project_id = ? ORDER BY version DESC'
   ).all(id);
@@ -267,6 +347,7 @@ function loadProject(db, id) {
     id: project.id,
     name: project.name,
     sub_version: project.sub_version,
+    attribution_version: project.attribution_version,
     created_at: project.created_at,
     words,
     cuts,
@@ -275,6 +356,8 @@ function loadProject(db, id) {
           min_duration_ms: rules.min_duration_ms, max_cps: rules.max_cps }
       : null,
     subtitles,
+    speakers,
+    attributions,
     exports: exportsList,
     revisions,
     word_revisions: wordRevisions,
@@ -333,6 +416,12 @@ function bumpSubVersion(db, projectId) {
   return db.prepare('SELECT sub_version FROM projects WHERE id = ?').get(projectId).sub_version;
 }
 
+/** 归属版本 +1（说话人改名或归属标注写入成功时调用），返回推进后的版本 */
+function bumpAttributionVersion(db, projectId) {
+  db.prepare('UPDATE projects SET attribution_version = attribution_version + 1 WHERE id = ?').run(projectId);
+  return db.prepare('SELECT attribution_version FROM projects WHERE id = ?').get(projectId).attribution_version;
+}
+
 /** 项目下全部逐词修正提议摘要（不含逐项明细），按时间倒序 */
 function listWordRevisions(db, projectId) {
   return db.prepare(
@@ -382,5 +471,6 @@ function loadWordRevision(db, projectId, revisionId) {
 
 module.exports = {
   initDb, loadProject, listRevisions, loadRevision,
-  listWordRevisions, loadWordRevision, bumpSubVersion, DEFAULT_RULES,
+  listWordRevisions, loadWordRevision, bumpSubVersion, bumpAttributionVersion,
+  DEFAULT_RULES,
 };

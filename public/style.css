@@ -240,3 +240,23 @@ button.danger { background: transparent; border: 1px solid var(--danger); color:
 .tr-hist-item { font-size: 12px; color: var(--muted);
   border: 1px dashed var(--border); border-radius: 6px; padding: 4px 8px; }
 #tr-panel h3 { margin: 14px 0 6px; font-size: 13px; color: var(--muted); }
+
+/* ---------- ⑧ 说话人标注 ---------- */
+.sp-registry { margin-bottom: 10px; }
+.sp-reg-row {
+  display: flex; align-items: center; gap: 8px; margin-bottom: 6px;
+}
+.sp-reg-row .sp-num {
+  font-weight: 600; min-width: 34px; color: var(--accent, #2b6cb0);
+}
+.sp-rename-input { flex: 1; }
+.sp-table { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }
+.sp-row {
+  display: grid; grid-template-columns: 1fr 150px 64px; gap: 8px;
+  align-items: center; padding: 6px 8px; border: 1px solid #e2e8f0; border-radius: 6px;
+  background: #fff;
+}
+.sp-row.locked { background: #f7fafc; border-style: dashed; }
+.sp-cue { font-size: 13px; line-height: 1.4; word-break: break-word; }
+.sp-history { font-size: 12px; color: #718096; }
+.sp-history div { padding: 2px 0; }
