@@ -230,6 +230,58 @@ CREATE TABLE IF NOT EXISTS translation_batch_items (
   result_version INTEGER NOT NULL,            -- 写入后的译文版本
   UNIQUE(batch_id, ord)
 );
+
+-- 说话人：项目内维护编号与显示名。显示名将写入 WebVTT <v 显示名> 说话人标签，
+-- 因此创建/改名时拒绝含换行或标签界定符（<、>）的显示名；编号项目内唯一、创建后不可变。
+CREATE TABLE IF NOT EXISTS speakers (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  code       TEXT NOT NULL,          -- 说话人编号（项目内唯一，创建后不可变）
+  name       TEXT NOT NULL,          -- 显示名（写入 WebVTT 说话人标签）
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(project_id, code)
+);
+
+-- 归属版本：项目级单调递增计数器。说话人新增/改名、归属批次写入、
+-- 归属随源行删除转历史，都会推进；归属提交与署名版导出携带以拒绝过期写入。
+CREATE TABLE IF NOT EXISTS attr_state (
+  project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+  version    INTEGER NOT NULL DEFAULT 0
+);
+
+-- 字幕 → 说话人归属：每条当前字幕最多一份当前归属（下方部分唯一索引强制）。
+-- 归属只锚定字幕 ID：重排保留 ID 的行归属继续有效（文本/时间/锁定/展示顺序变化不影响）；
+-- 源行删除后归属留作历史（subtitle_id 置空），新行待标注，不按展示序号转移。
+CREATE TABLE IF NOT EXISTS attributions (
+  id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id           INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  subtitle_id          INTEGER REFERENCES subtitles(id) ON DELETE SET NULL, -- 当前源字幕；行删除后留空作历史
+  speaker_id           INTEGER NOT NULL REFERENCES speakers(id),
+  status               TEXT NOT NULL DEFAULT 'current',  -- current（当前有效）/ history（源行已删除）
+  cue_version_snapshot INTEGER NOT NULL,                 -- 标注时读取的源字幕行版本
+  created_at           TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at           TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_attributions_one_per_cue
+  ON attributions(project_id, subtitle_id) WHERE status = 'current';
+CREATE INDEX IF NOT EXISTS idx_attributions_project
+  ON attributions(project_id, status);
+
+-- 署名版导出快照：带 WebVTT 说话人标签的不可变文件。原文（lang 为 NULL）与
+-- 各语言译文共用项目内同一递增序列；记录冻结时的字幕集版本与归属版本。
+CREATE TABLE IF NOT EXISTS attributed_exports (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id   INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  lang         TEXT,                     -- NULL = 原文；否则为目标语言代号
+  version      INTEGER NOT NULL,         -- 项目内递增（原文与译文共用同一序列）
+  content      TEXT NOT NULL,            -- 带 <v> 说话人标签的 WebVTT 快照，生成后不再改变
+  cue_count    INTEGER NOT NULL,
+  sub_version  INTEGER NOT NULL,         -- 冻结时的字幕集版本
+  attr_version INTEGER NOT NULL,         -- 冻结时的归属版本
+  created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(project_id, version)
+);
 `;
 
 const DEFAULT_RULES = { max_chars: 30, min_duration_ms: 800, max_cps: 20 };
@@ -267,6 +319,7 @@ function loadProject(db, id) {
     id: project.id,
     name: project.name,
     sub_version: project.sub_version,
+    attr_version: getAttrVersion(db, id),
     created_at: project.created_at,
     words,
     cuts,
@@ -333,6 +386,21 @@ function bumpSubVersion(db, projectId) {
   return db.prepare('SELECT sub_version FROM projects WHERE id = ?').get(projectId).sub_version;
 }
 
+/** 项目当前归属版本（无记录时为 0） */
+function getAttrVersion(db, projectId) {
+  const row = db.prepare('SELECT version FROM attr_state WHERE project_id = ?').get(projectId);
+  return row ? row.version : 0;
+}
+
+/** 推进归属版本（说话人/归属状态每次变化 +1），返回推进后的版本 */
+function bumpAttrVersion(db, projectId) {
+  db.prepare(
+    `INSERT INTO attr_state (project_id, version) VALUES (?, 1)
+     ON CONFLICT(project_id) DO UPDATE SET version = version + 1`
+  ).run(projectId);
+  return getAttrVersion(db, projectId);
+}
+
 /** 项目下全部逐词修正提议摘要（不含逐项明细），按时间倒序 */
 function listWordRevisions(db, projectId) {
   return db.prepare(
@@ -382,5 +450,6 @@ function loadWordRevision(db, projectId, revisionId) {
 
 module.exports = {
   initDb, loadProject, listRevisions, loadRevision,
-  listWordRevisions, loadWordRevision, bumpSubVersion, DEFAULT_RULES,
+  listWordRevisions, loadWordRevision, bumpSubVersion,
+  getAttrVersion, bumpAttrVersion, DEFAULT_RULES,
 };

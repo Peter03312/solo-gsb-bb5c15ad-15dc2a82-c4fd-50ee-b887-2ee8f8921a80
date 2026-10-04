@@ -17,6 +17,7 @@
 - **多语言译文字幕**：按原时间轴维护多语言译文。校对者以**非空目标语言代号、字幕 ID、读取时行版本 `cue_version` 与译文版本 `version`**（新建传 0/省略）保存译文；查询逐行并列原文、译文与状态（`current`/`review`/`missing`）。同一语言每条当前字幕最多一份译文。译文**沿用源字幕起止与词区间**，接口不接受任何时间/切点/原文字段，且须满足当前**最大字数与字速**规则（时长随源行）。源字幕**文本/时间/词区间**变化 → 译文自动转**待复核**；仅锁定或展示顺序变化不使译文失效；重排删除的原行译文**留作历史**，新行视为缺译，**不按序号自动挪用**。校对者可在当前源行上确认待复核译文，过期版本或无效译文返回当前值与原因且不改数据。按语言导出前须确认当前每行均有有效译文且整版符合时间与切点约束，否则分类列出缺漏/待复核/无效/冲突且**不生成快照**；成功导出的译文 WebVTT 快照**不可变**，与原文导出相互独立。
 - **片方多语字幕交付（批次冻结）**：一次提交把**原文与选定的多种语言冻结为同一时间轴的一个批次**。请求携带当前字幕集版本 `sub_version`、规则版本 `rules_version`、**非空且不重复**的目标语言列表，以及各语言**逐行译文版本**清单。服务端在**同一个事务内**核对：提交版本仍有效（字幕集/规则漂移 → `409`）、源字幕整版结构（词覆盖/不重叠/不跨切点/不缩短词时段）与现行规则通过、每种语言每行译文均为 `current` 且满足字数/字速、译文版本与提交一致；任一语言**缺译/待复核/无效/版本漂移**都按语言和字幕行返回原因，**整批不生成快照、不消耗版本**。成功时在现有**原文导出序列与各语言导出序列**中各生成一个不可变 WebVTT 版本（因此文件直接经现有下载接口取得），并以**批次清单**关联文件、字幕集版本与规则版本；各文件时间轴完全一致，后续编辑不改变旧批次。既有原文导出、单语言导出及下载约定保持兼容。
 - **译者整批译文回填（本轮新增）**：译者完成整批译文后，可按**一种目标语言**把整批译文回填到当前字幕。提交**批次编号** `batch_no`、读取时字幕集版本 `sub_version`、规则版本 `rules_version` 与**非空逐行清单**（字幕 ID、源行版本 `cue_version`、译文版本 `version`（新建 `0`/省略）、非空文本）。按字幕 ID 对齐，允许覆盖**待复核**译文；**同批重复 ID、无效语言、不存在的字幕**一律拒绝。提交时在事务内重新核对版本、源行及当前**字数/字速**规则：任一行过期（字幕集/规则/源行/译文版本）或违规，**按行返回当前值与原因，整批不写入**。通过后在**同一事务**保存全部译文——新建版本从 `1` 开始，更新版本递增并把源快照刷新为 `current`；**未列出的行与其他语言不变**，且回填只写译文、不推进 `sub_version`。**同项目同语言批次编号重复且内容相同**（内容指纹对清单按字幕 ID 排序，提交顺序不影响判定）→ 返回首次结果（`200 replayed`）而不再次写入；**编号相同但内容不同** → `409` 冲突；**失败批次不占编号**。回填结果就是普通译文，逐行译文操作、单语言导出与多语交付继续读取，**旧导出快照保持不变**。
+- **说话人归属与署名版导出（本轮新增）**：审校人员在现有字幕上标明发言者。项目内维护**说话人编号与显示名**（编号唯一不可变；显示名拒绝含换行或标签界定符 `<`、`>`，因为会写入 WebVTT `<v 显示名>` 标签）；说话人新增/改名、归属写入、归属随源行删除转历史都推进项目级**归属版本** `attr_version`。归属提交按**字幕 ID** 携带读取时**行版本** `cue_version` 与**归属版本**：编号须存在（未知 → `400`），**锁定行也可标注**；任一过期整批不生效（`409` 返回当前值与逐行原因）。归属只锚定字幕 ID：**重排保留 ID 的行归属继续有效**（文本/时间/锁定/展示顺序变化不影响）；**原行删除后归属留作历史**，新行待标注，**不按展示序号转移**。署名版导出须携带**字幕集版本与归属版本**，在**同一事务**中核对源整版结构/规则、**每条当前字幕均有有效归属**、显示名可写入标签；可**选择原文或一种目标语言**——选择译文时携带**逐行译文版本**，译文须逐行 `current`、版本未变且满足现行字数/字速，否则**按行列原因且不生成快照**。署名版按 WebVTT 语法写入 `<v 显示名>文本</v>` 说话人标签，**原文与译文共用时间轴**；快照另存于 `attributed_exports`（项目内单序列），**不可变、可查询、可下载**；普通导出及旧下载内容保持兼容、互不影响。
 
 ## 启动
 
@@ -67,6 +68,7 @@ Compose 默认把 SQLite 挂到命名卷 `subtitle-data` 持久化（含所有�
 8. **多语言译文（本轮新增）**：在左侧 ⑦ 面板填入语言代号（如 `en`）并"载入语言"，逐行对照原文保存译文；源行变更后状态变"待复核"，可"✓ 确认仍适用"或重新保存；全部有效后点"校验并导出该语言 WebVTT"，缺漏/冲突会分类列出且不生成快照。HTTP 流程见 `examples/translations-api.sh`。
 9. **片方交付批次**：各语言译文都 current 且有效后，按 `POST /api/projects/:id/deliveries` 提交 `{sub_version, rules_version, languages, translations:{lang:[{subtitle_id, version}]}}`，服务端事务内整版核对，通过即把原文与各语言冻结为同一时间轴的一个批次（各序列生成不可变 WebVTT，文件走既有下载接口）；失败按语言和字幕行返回原因且不生成快照、不耗版本。清单用 `GET /api/projects/:id/deliveries` 查询。HTTP 流程见 `examples/deliveries-api.sh`。
 10. **译者整批译文回填（本轮新增）**：整批译文完成后，按 `POST /api/projects/:id/translations/:lang/batches` 一次提交一种语言，携带 `batch_no`、`sub_version`、`rules_version` 与逐行 `items:[{subtitle_id, cue_version, version, text}]`（新建 `version=0`）；同批重复 ID/无效语言/不存在字幕 → `400`，版本过期 → `409`，超字数/字速 → `422`，均按行返回当前值与原因且整批不写入；成功后新建从 v1、更新版本 +1（可覆盖待复核）。同编号同内容重放返回首次结果（`200 replayed`），同编号不同内容 `409` 冲突，失败不占编号。回填结果直接被并列查询、单语言导出与多语交付读取。HTTP 流程见 `examples/translation-batches-api.sh`。
+11. **说话人归属与署名版导出（本轮新增）**：先 `POST /api/projects/:id/speakers` 维护说话人（编号 + 显示名，改名推进归属版本），再 `POST /api/projects/:id/attributions` 按字幕 ID 提交归属（携带行版本与归属版本，锁定行也可标注）；`GET /api/projects/:id/attributions` 查看逐行归属状态。全部行标注完成后 `POST /api/projects/:id/attributed-exports` 导出署名版：携带 `sub_version` 与 `attr_version`，省略 `lang` 导出原文，或指定一种语言并携带逐行译文版本；生成的 `<v 显示名>` 标签 WebVTT 快照经 `GET /api/projects/:id/attributed-exports/:version` 下载，内容不可变。HTTP 流程见 `examples/attributions-api.sh`。
 
 ## API 摘要
 
@@ -106,6 +108,14 @@ Compose 默认把 SQLite 挂到命名卷 `subtitle-data` 持久化（含所有�
 | `POST` | `/api/projects/:id/deliveries` | **片方交付批次**：`{note?, sub_version, rules_version, languages:[...], translations:{lang:[{subtitle_id, version}]}}`；事务内核对版本/结构/规则/逐行译文，通过则原文与各语言各生成一个不可变 WebVTT 并关联批次 |
 | `GET` | `/api/projects/:id/deliveries` | 交付批次清单（倒序，含每批文件清单、字幕集/规则版本） |
 | `GET` | `/api/projects/:id/deliveries/:bid` | 单个批次清单（文件序列版本与既有下载地址；正文走下载接口） |
+| `GET` | `/api/projects/:id/speakers` | 说话人列表 + 当前归属版本 `attr_version` |
+| `POST` | `/api/projects/:id/speakers` | 新建说话人 `{code, name}`；编号唯一、显示名拒绝换行与 `<`/`>` → `400`，编号重复 → `409`；推进归属版本 |
+| `PATCH` | `/api/projects/:id/speakers/:code` | 说话人改名 `{name, attr_version?}`；显示名修改推进归属版本（名字不变不推进），未知编号 → `404`，版本过期 → `409` |
+| `GET` | `/api/projects/:id/attributions` | 归属视图：逐行 字幕 + 说话人 + 状态（`attributed`/`missing`）、归属版本与历史归属 |
+| `POST` | `/api/projects/:id/attributions` | 提交一批归属 `{attr_version, items:[{subtitle_id, cue_version, speaker}]}`；锁定行也可标注；编号/字幕不存在 → `400`，版本过期 → `409`（带当前值），通过则整批 upsert 并推进归属版本 |
+| `POST` | `/api/projects/:id/attributed-exports` | **署名版导出**：`{sub_version, attr_version, lang?, translations?}`；事务内核对每条当前字幕均有有效归属（选译文时逐行译文有效且版本未变），生成带 `<v>` 标签的不可变 WebVTT 快照 |
+| `GET` | `/api/projects/:id/attributed-exports` | 署名版快照列表（项目内单序列，原文 `lang` 为 `null`） |
+| `GET` | `/api/projects/:id/attributed-exports/:version` | 下载某版本署名版 `.vtt`（内容创建后不变） |
 
 修订请求与核对说明：
 
@@ -314,11 +324,64 @@ Compose 默认把 SQLite 挂到命名卷 `subtitle-data` 持久化（含所有�
 
 完整 curl 示例：`examples/deliveries-api.sh`（准备双语译文→非法/漂移/缺译/待复核/译文版本漂移各类失败→成功批次→清单查询→既有接口下载→后续编辑不改旧批次→第二批在各序列取新版本）。
 
+## 说话人归属与署名版导出（标注 → 归属提交 → 署名快照）
+
+审校人员在**现有字幕**上标明发言者，并导出带 WebVTT 说话人标签的署名版文件。归属只锚定**字幕 ID**，与译文类似是叠加在字幕上的一层数据，不改词、切点、原文与时间轴。
+
+### 说话人与归属版本
+
+- 项目内维护说话人**编号** `code`（唯一、创建后不可变，如 `S1`、`speaker-01`）与**显示名** `name`。
+- 显示名会写入 WebVTT `<v 显示名>` 标签，因此创建/改名时**拒绝含换行或标签界定符（`<`、`>`）的显示名**（`400`）；导出前还会对存量数据再复核一次（`422 invalid_speakers`）。
+- 项目级**归属版本** `attr_version` 单调递增：说话人新增/改名、归属批次写入、归属随源行删除转历史都会推进；归属提交与署名版导出携带它以拒绝过期写入（名字不变的改名是空操作，不推进）。
+
+### 归属提交（组级、乐观锁、原子）
+
+`POST /api/projects/:id/attributions`
+
+```json
+{
+  "attr_version": 3,
+  "items": [
+    {"subtitle_id": 1, "cue_version": 2, "speaker": "S1"},
+    {"subtitle_id": 2, "cue_version": 1, "speaker": "S2"}
+  ]
+}
+```
+
+- 每项按**字幕 ID** 携带**读取时行版本** `cue_version` 与说话人编号；**锁定行也可标注**（与修订提议不同）。
+- `400`：空组、同批字幕 ID 重复、字段非法、**说话人编号不存在**（编号须存在）、字幕行不存在。
+- `409`：`attr_version` 过期或任一行 `cue_version` 过期——**整批不生效**，返回当前值（当前归属版本、说话人、字幕）与逐行原因。
+- 通过后在**同一事务**内逐行 upsert（新标注 `created` / 改标 `updated` 覆盖当前归属）并推进归属版本；`GET /api/projects/:id/attributions` 逐行查看状态（`attributed`/`missing`）与历史归属。
+
+### 归属随字幕变更的命运
+
+- **重排保留 ID 的行归属继续有效**：身份保持（词区间相同）的行、锁定行、仅文本/时间/锁定/展示顺序变化的行，归属都不受影响。
+- **原行删除后归属留作历史**：重排删除、词修正确认替换、重新导入删除的源行，其归属转 `history`（`subtitle_id` 置空）并推进归属版本；**新行待标注，绝不按展示序号转移**。
+
+### 署名版导出（事务内核对，不可变快照）
+
+`POST /api/projects/:id/attributed-exports`
+
+```json
+{"sub_version": 2, "attr_version": 4}
+{"sub_version": 2, "attr_version": 4, "lang": "en",
+ "translations": [{"subtitle_id": 1, "version": 1}, {"subtitle_id": 2, "version": 1}]}
+```
+
+- 必须携带**字幕集版本** `sub_version` 与**归属版本** `attr_version`（任一漂移 → `409` 带当前值）。
+- **可选择原文或一种目标语言**：省略 `lang` 导出原文；指定 `lang` 时必须携带**逐行译文版本**清单（与当前字幕行一一对应），未选译文时不得携带 `translations`。
+- 在**同一事务**中核对：源整版结构（词覆盖/不重叠/不跨切点/不缩短词时段）与现行规则通过；**每条当前字幕均有有效归属**；显示名可写入标签；选择译文时逐行译文 `current`、**版本未变**且满足现行字数/字速。
+- 失败分类返回且不生成快照：`conflicts`（源整版）、`missing_attribution`（缺归属，逐行）、`invalid_speakers`（显示名非法）、`translation.missing/review/invalid/version_stale`（译文逐行原因）→ `422`。
+- 通过则按 WebVTT 语法写出 `<v 显示名>文本</v>` 说话人标签；**原文与译文共用同一时间轴**（译文沿用源行起止）。快照存于 `attributed_exports`（项目内**单序列**，原文 `lang` 为 `null`），记录冻结时的 `sub_version` 与 `attr_version`；`GET …/attributed-exports` 列版本、`GET …/attributed-exports/:version` 下载，**内容创建后不变**。
+- **兼容**：普通导出（`exports` / `translation_exports`）及旧下载内容不含说话人标签、序列互不影响；署名版是另存的独立快照序列。
+
+完整 curl 示例：`examples/attributions-api.sh`（建项目排版→说话人增改→非法显示名→归属提交（含锁定行）→版本过期→归属视图→原文/译文署名导出→清单下载→重排与重新导入后的归属命运）。
+
 ## 目录结构
 
 ```
 server.js            入口：初始化 SQLite、播种演示数据、启动 HTTP
-src/db.js            连接与建表（projects/words/shots/rules/subtitles/exports/revisions/revision_items/word_revisions/word_revision_items/translations/translation_exports/delivery_batches/delivery_files/translation_batches/translation_batch_items）
+src/db.js            连接与建表（projects/words/shots/rules/subtitles/exports/revisions/revision_items/word_revisions/word_revision_items/translations/translation_exports/delivery_batches/delivery_files/translation_batches/translation_batch_items/speakers/attr_state/attributions/attributed_exports）
 src/layout.js        排版引擎（纯函数）：切点分析 → 分段 → 定时 → 结构自检
 src/validate.js      导入与编辑校验
 src/revision.js      批量字幕修订提议：请求解析 + 整组候选核对（词区间/时间/切点/相邻/规则/版本）
@@ -326,7 +389,8 @@ src/word-revision.js 逐词时间修正：请求解析 + 候选整版核对（�
 src/translation.js   多语言译文字幕：解析/规则校验/并列视图/失效对账（current→review/history）/导出核对
 src/translation-batch.js 译者整批译文回填：请求解析/内容指纹/事务内逐行版本与规则核对/幂等与批次清单
 src/delivery.js      片方多语交付批次：请求解析 + 事务内整版/逐语言逐行核对 + 批次清单视图
-src/vtt.js           WebVTT 序列化（原文与译文导出共用）
+src/attribution.js   说话人归属与署名版导出：说话人解析/显示名校验/归属提交核对/归属对账/署名版导出核对与快照清单
+src/vtt.js           WebVTT 序列化（原文/译文导出与署名版 <v> 说话人标签共用）
 src/routes.js        Express API
 public/              前端（原生 HTML/CSS/JS 单页，含字幕修订、逐词修正与多语言译文面板）
 examples/sample.json 示例转写与切点
@@ -335,6 +399,7 @@ examples/word-revisions-api.sh 逐词时间修正（提交→预览→确认）�
 examples/translations-api.sh 多语言译文字幕（保存→查询→失效/复核→确认→按语言导出）的完整 curl 调用示例
 examples/translation-batches-api.sh 译者整批译文回填（整批写入→幂等/冲突→过期/违规→覆盖待复核→下游读取）的完整 curl 调用示例
 examples/deliveries-api.sh 片方多语交付批次（核对→整批冻结→清单查询→既有接口下载）的完整 curl 调用示例
-test/                node:test 单元 + API 集成测试（revision / word-revision / translation / translation-batch / delivery 覆盖五类流程）
+examples/attributions-api.sh 说话人归属与署名版导出（说话人→归属提交→署名快照→重排联动）的完整 curl 调用示例
+test/                node:test 单元 + API 集成测试（revision / word-revision / translation / translation-batch / delivery / attribution 覆盖六类流程）
 Dockerfile / docker-compose.yml
 ```

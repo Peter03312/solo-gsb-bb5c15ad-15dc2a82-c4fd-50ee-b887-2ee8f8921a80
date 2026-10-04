@@ -28,4 +28,24 @@ function toWebVtt(cues) {
   return blocks.join('\n');
 }
 
-module.exports = { toWebVtt, formatTimestamp };
+/**
+ * 生成带说话人标签的 WebVTT（署名版）。cues 需已按时间升序：
+ * [{ start_ms, end_ms, text, speaker }]
+ * 每条 cue 文本按 WebVTT 语音语法写作 <v 显示名>文本</v>；
+ * 显示名在说话人创建/改名时已校验（不含换行与标签界定符 <、>），导出前再复核。
+ */
+function toWebVttWithSpeakers(cues) {
+  const sorted = [...cues].sort((a, b) => a.start_ms - b.start_ms || a.end_ms - b.end_ms);
+  const blocks = ['WEBVTT', ''];
+  sorted.forEach((c, i) => {
+    blocks.push(
+      String(i + 1),
+      `${formatTimestamp(c.start_ms)} --> ${formatTimestamp(c.end_ms)}`,
+      `<v ${c.speaker}>${c.text}</v>`,
+      ''
+    );
+  });
+  return blocks.join('\n');
+}
+
+module.exports = { toWebVtt, toWebVttWithSpeakers, formatTimestamp };
